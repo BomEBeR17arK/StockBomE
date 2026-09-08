@@ -33,7 +33,7 @@ const DEFAULT_SCAN_LIST = [
 ];
 
 const RANGE_TO_INTERVAL = {
-  "1mo": "1d", "3mo": "1d", "6mo": "1d", "1y": "1wk",
+  "1mo": "1d", "3mo": "1d", "6mo": "1d", "1y": "1d",
 };
 
 // ---------------- state ----------------
@@ -510,11 +510,43 @@ function renderDetailTabChart(symbol) {
     </div>
 
     <div class="chart-card">
-      <canvas id="priceChart" height="180"></canvas>
+      <div class="chart-panel-label">ราคา (แท่งเทียน) + EMA 15 / 50 / 200</div>
+      <canvas id="priceChart"></canvas>
       <div class="chart-legend">
-        <span><i class="dot" style="background:var(--accent)"></i>ราคาปิด</span>
-        <span><i class="dot" style="background:#3a4050"></i>ปริมาณ</span>
-        <span><i class="dot" style="background:var(--warn)"></i>ปริมาณผิดปกติ</span>
+        <span><i class="dot" style="background:var(--accent)"></i>ราคาขึ้น</span>
+        <span><i class="dot" style="background:var(--danger)"></i>ราคาลง</span>
+        <span><i class="dot" style="background:#ffa657"></i>EMA15</span>
+        <span><i class="dot" style="background:#d2a8ff"></i>EMA50</span>
+        <span><i class="dot" style="background:#e3b341"></i>EMA200</span>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-panel-label">ปริมาณซื้อขาย (Buy / Sell Volume)</div>
+      <canvas id="volChart"></canvas>
+      <div class="chart-legend">
+        <span><i class="dot" style="background:var(--accent)"></i>แรงซื้อ</span>
+        <span><i class="dot" style="background:var(--danger)"></i>แรงขาย</span>
+        <span><i class="dot" style="background:#3a4050"></i>เส้นเฉลี่ย</span>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-panel-label">OBV (On-Balance Volume)</div>
+      <canvas id="obvChart"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-panel-label">RSI (14)</div>
+      <canvas id="rsiChart"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-panel-label">MACD (12, 26, 9)</div>
+      <canvas id="macdChart"></canvas>
+      <div class="chart-legend">
+        <span><i class="dot" style="background:var(--accent)"></i>MACD</span>
+        <span><i class="dot" style="background:#ffa657"></i>Signal</span>
       </div>
     </div>
 
@@ -695,13 +727,75 @@ function toggleWatch(symbol) {
   }
 }
 
-// ---------------- canvas chart (price line + volume bars, no libs) ----------------
-function drawChart(chart) {
-  const canvas = document.getElementById("priceChart");
-  if (!canvas) return;
+// ---------------- indicator math (no libs) ----------------
+function calcEMA(values, period) {
+  const out = new Array(values.length).fill(null);
+  const alpha = 2 / (period + 1);
+  let prev = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (v == null) { out[i] = prev; continue; }
+    prev = prev == null ? v : alpha * v + (1 - alpha) * prev;
+    out[i] = prev;
+  }
+  return out;
+}
+
+function calcRSI(values, period = 14) {
+  const out = new Array(values.length).fill(null);
+  let avgGain = null, avgLoss = null;
+  const gains = [], losses = [];
+  for (let i = 1; i < values.length; i++) {
+    const prevV = values[i - 1], v = values[i];
+    if (prevV == null || v == null) { gains.push(0); losses.push(0); continue; }
+    const d = v - prevV;
+    gains.push(Math.max(d, 0));
+    losses.push(Math.max(-d, 0));
+  }
+  for (let i = 0; i < gains.length; i++) {
+    if (avgGain == null) {
+      if (i + 1 < period) continue;
+      const gWin = gains.slice(i + 1 - period, i + 1);
+      const lWin = losses.slice(i + 1 - period, i + 1);
+      avgGain = gWin.reduce((a, b) => a + b, 0) / period;
+      avgLoss = lWin.reduce((a, b) => a + b, 0) / period;
+    } else {
+      avgGain = (avgGain * (period - 1) + gains[i]) / period;
+      avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+    }
+    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+    out[i + 1] = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
+  }
+  return out;
+}
+
+function calcMACD(values, fast = 12, slow = 26, signal = 9) {
+  const emaFast = calcEMA(values, fast);
+  const emaSlow = calcEMA(values, slow);
+  const macdLine = values.map((_, i) =>
+    emaFast[i] != null && emaSlow[i] != null ? emaFast[i] - emaSlow[i] : null
+  );
+  const signalLine = calcEMA(macdLine, signal);
+  const histogram = macdLine.map((v, i) => (v != null && signalLine[i] != null) ? v - signalLine[i] : null);
+  return { macdLine, signalLine, histogram };
+}
+
+function calcOBV(closes, vols) {
+  const out = new Array(closes.length).fill(0);
+  let obv = 0;
+  for (let i = 1; i < closes.length; i++) {
+    if (closes[i] == null || closes[i - 1] == null || vols[i] == null) { out[i] = obv; continue; }
+    if (closes[i] > closes[i - 1]) obv += vols[i];
+    else if (closes[i] < closes[i - 1]) obv -= vols[i];
+    out[i] = obv;
+  }
+  return out;
+}
+
+// ---------------- canvas setup helper ----------------
+function setupCanvas(canvas, cssHeight) {
   const dpr = window.devicePixelRatio || 1;
   const cssWidth = canvas.parentElement.clientWidth - 12;
-  const cssHeight = 190;
   canvas.width = cssWidth * dpr;
   canvas.height = cssHeight * dpr;
   canvas.style.width = cssWidth + "px";
@@ -709,63 +803,283 @@ function drawChart(chart) {
   const ctx = canvas.getContext("2d");
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, cssWidth, cssHeight);
+  return { ctx, cssWidth, cssHeight };
+}
 
-  const closes = chart.close.map((v) => v == null ? null : v);
-  const vols = chart.volume;
+function xAt(i, n, plotW, padL) { return padL + (plotW * i) / ((n - 1) || 1); }
+
+function drawGridLines(ctx, cssWidth, top, height, padL, padR, lines) {
+  ctx.strokeStyle = "#1c2130";
+  ctx.lineWidth = 1;
+  lines.forEach((frac) => {
+    const y = top + height * frac;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(cssWidth - padR, y);
+    ctx.stroke();
+  });
+}
+
+// ---------------- panel: candlestick price + EMA ----------------
+function drawPricePanel(chart, ema15, ema50, ema200) {
+  const canvas = document.getElementById("priceChart");
+  if (!canvas) return;
+  const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 230);
+
+  const opens = chart.open, highs = chart.high, lows = chart.low, closes = chart.close;
   const n = closes.length;
   if (!n) return;
 
-  const validCloses = closes.filter(v => v != null);
-  const minC = Math.min(...validCloses), maxC = Math.max(...validCloses);
-  const maxV = Math.max(...vols.filter(v => v != null), 1);
+  const validHigh = highs.filter(v => v != null);
+  const validLow = lows.filter(v => v != null);
+  if (!validHigh.length) return;
+  const maxP = Math.max(...validHigh);
+  const minP = Math.min(...validLow);
+  const range = (maxP - minP) || 1;
 
-  const padL = 4, padR = 4, padT = 10;
-  const priceH = cssHeight * 0.62;
-  const volH = cssHeight * 0.28;
-  const volTop = priceH + 14;
+  const padL = 4, padR = 4, padT = 8, padB = 8;
+  const plotH = cssHeight - padT - padB;
   const plotW = cssWidth - padL - padR;
 
-  function ratioAt(i) {
-    const start = Math.max(0, i - 20);
-    const hist = [];
-    for (let j = start; j < i; j++) if (vols[j] != null) hist.push(vols[j]);
-    if (!hist.length) return 0;
-    const avg = hist.reduce((a, b) => a + b, 0) / hist.length;
-    return avg ? vols[i] / avg : 0;
+  drawGridLines(ctx, cssWidth, padT, plotH, padL, padR, [0, 0.25, 0.5, 0.75, 1]);
+
+  const yAt = (p) => padT + plotH - ((p - minP) / range) * plotH;
+  const candleW = Math.max(1.5, (plotW / n) * 0.62);
+
+  for (let i = 0; i < n; i++) {
+    if (opens[i] == null || closes[i] == null || highs[i] == null || lows[i] == null) continue;
+    const x = xAt(i, n, plotW, padL);
+    const up = closes[i] >= opens[i];
+    ctx.strokeStyle = ctx.fillStyle = up ? "#00d68f" : "#ff5c5c";
+    ctx.lineWidth = 1;
+    // wick
+    ctx.beginPath();
+    ctx.moveTo(x, yAt(highs[i]));
+    ctx.lineTo(x, yAt(lows[i]));
+    ctx.stroke();
+    // body
+    const yO = yAt(opens[i]), yC = yAt(closes[i]);
+    const top = Math.min(yO, yC);
+    const h = Math.max(1, Math.abs(yC - yO));
+    ctx.fillRect(x - candleW / 2, top, candleW, h);
   }
 
-  const barW = Math.max(1, plotW / n * 0.7);
+  function drawEmaLine(ema, color) {
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      if (ema[i] == null) continue;
+      const x = xAt(i, n, plotW, padL);
+      const y = yAt(ema[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  }
+  drawEmaLine(ema15, "#ffa657");
+  drawEmaLine(ema50, "#d2a8ff");
+  drawEmaLine(ema200, "#e3b341");
+}
+
+// ---------------- panel: buy/sell volume (stacked) ----------------
+function drawVolumePanel(chart) {
+  const canvas = document.getElementById("volChart");
+  if (!canvas) return;
+  const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 100);
+
+  const opens = chart.open, highs = chart.high, lows = chart.low, closes = chart.close, vols = chart.volume;
+  const n = closes.length;
+  if (!n) return;
+
+  const buyVol = new Array(n).fill(0), sellVol = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    if (vols[i] == null || highs[i] == null || lows[i] == null || closes[i] == null) continue;
+    const hl = highs[i] - lows[i];
+    const bv = hl > 0 ? vols[i] * ((closes[i] - lows[i]) / hl) : vols[i] / 2;
+    buyVol[i] = bv;
+    sellVol[i] = vols[i] - bv;
+  }
+  const totals = vols.map(v => v || 0);
+  const maxV = Math.max(...totals, 1);
+  const validVols = vols.filter(v => v != null);
+  const avgV = validVols.length ? validVols.reduce((a, b) => a + b, 0) / validVols.length : 0;
+
+  const padL = 4, padR = 4, padT = 6, padB = 6;
+  const plotH = cssHeight - padT - padB;
+  const plotW = cssWidth - padL - padR;
+  const barW = Math.max(1.5, (plotW / n) * 0.62);
+
   for (let i = 0; i < n; i++) {
     if (vols[i] == null) continue;
-    const x = padL + (plotW * i) / (n - 1 || 1);
-    const h = (vols[i] / maxV) * volH;
-    const r = ratioAt(i);
-    ctx.fillStyle = r >= state.settings.strongTh ? "#f5a623" : r >= state.settings.earlyTh ? "#c9862a" : "#2e3341";
-    ctx.fillRect(x - barW / 2, volTop + volH - h, barW, h);
+    const x = xAt(i, n, plotW, padL);
+    const bH = (buyVol[i] / maxV) * plotH;
+    const sH = (sellVol[i] / maxV) * plotH;
+    ctx.fillStyle = "rgba(0,214,143,0.75)";
+    ctx.fillRect(x - barW / 2, padT + plotH - bH, barW, bH);
+    ctx.fillStyle = "rgba(255,92,92,0.7)";
+    ctx.fillRect(x - barW / 2, padT + plotH - bH - sH, barW, sH);
   }
+
+  if (avgV) {
+    const y = padT + plotH - (avgV / maxV) * plotH;
+    ctx.strokeStyle = "#5a6172";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(cssWidth - padR, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+// ---------------- panel: OBV ----------------
+function drawOBVPanel(obv) {
+  const canvas = document.getElementById("obvChart");
+  if (!canvas) return;
+  const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 80);
+
+  const n = obv.length;
+  if (!n) return;
+  const minO = Math.min(...obv), maxO = Math.max(...obv);
+  const range = (maxO - minO) || 1;
+
+  const padL = 4, padR = 4, padT = 6, padB = 6;
+  const plotH = cssHeight - padT - padB;
+  const plotW = cssWidth - padL - padR;
+  const yAt = (v) => padT + plotH - ((v - minO) / range) * plotH;
+
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = xAt(i, n, plotW, padL);
+    const y = yAt(obv[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.lineTo(xAt(n - 1, n, plotW, padL), padT + plotH);
+  ctx.lineTo(padL, padT + plotH);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  grad.addColorStop(0, "rgba(0,214,143,0.22)");
+  grad.addColorStop(1, "rgba(0,214,143,0)");
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = xAt(i, n, plotW, padL);
+    const y = yAt(obv[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = "#00d68f";
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+}
+
+// ---------------- panel: RSI ----------------
+function drawRSIPanel(rsi) {
+  const canvas = document.getElementById("rsiChart");
+  if (!canvas) return;
+  const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 90);
+
+  const n = rsi.length;
+  if (!n) return;
+  const padL = 4, padR = 4, padT = 6, padB = 6;
+  const plotH = cssHeight - padT - padB;
+  const plotW = cssWidth - padL - padR;
+  const yAt = (v) => padT + plotH - (v / 100) * plotH;
+
+  [[70, "#ff5c5c"], [50, "#3a4050"], [30, "#00d68f"]].forEach(([level, color]) => {
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.55;
+    ctx.setLineDash(level === 50 ? [3, 3] : []);
+    ctx.beginPath();
+    ctx.moveTo(padL, yAt(level));
+    ctx.lineTo(cssWidth - padR, yAt(level));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  });
 
   ctx.beginPath();
   let started = false;
   for (let i = 0; i < n; i++) {
-    if (closes[i] == null) continue;
-    const x = padL + (plotW * i) / (n - 1 || 1);
-    const y = padT + priceH - ((closes[i] - minC) / ((maxC - minC) || 1)) * priceH;
+    if (rsi[i] == null) continue;
+    const x = xAt(i, n, plotW, padL);
+    const y = yAt(rsi[i]);
     if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
   }
-  ctx.strokeStyle = "#00d68f";
-  ctx.lineWidth = 1.8;
+  ctx.strokeStyle = "#ffa657";
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+}
+
+// ---------------- panel: MACD ----------------
+function drawMACDPanel(macdLine, signalLine, histogram) {
+  const canvas = document.getElementById("macdChart");
+  if (!canvas) return;
+  const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 90);
+
+  const n = macdLine.length;
+  if (!n) return;
+  const vals = [...macdLine, ...signalLine, ...histogram].filter(v => v != null);
+  if (!vals.length) return;
+  const maxAbs = Math.max(...vals.map(v => Math.abs(v)), 1e-9);
+
+  const padL = 4, padR = 4, padT = 6, padB = 6;
+  const plotH = cssHeight - padT - padB;
+  const plotW = cssWidth - padL - padR;
+  const midY = padT + plotH / 2;
+  const yAt = (v) => midY - (v / maxAbs) * (plotH / 2);
+  const barW = Math.max(1.5, (plotW / n) * 0.6);
+
+  ctx.strokeStyle = "#3a4050";
+  ctx.beginPath();
+  ctx.moveTo(padL, midY);
+  ctx.lineTo(cssWidth - padR, midY);
   ctx.stroke();
 
-  if (started) {
-    ctx.lineTo(padL + plotW, padT + priceH);
-    ctx.lineTo(padL, padT + priceH);
-    ctx.closePath();
-    const grad = ctx.createLinearGradient(0, padT, 0, padT + priceH);
-    grad.addColorStop(0, "rgba(0,214,143,0.18)");
-    grad.addColorStop(1, "rgba(0,214,143,0)");
-    ctx.fillStyle = grad;
-    ctx.fill();
+  for (let i = 0; i < n; i++) {
+    if (histogram[i] == null) continue;
+    const x = xAt(i, n, plotW, padL);
+    const y = yAt(histogram[i]);
+    ctx.fillStyle = histogram[i] >= 0 ? "rgba(0,214,143,0.6)" : "rgba(255,92,92,0.6)";
+    ctx.fillRect(x - barW / 2, Math.min(y, midY), barW, Math.max(1, Math.abs(y - midY)));
   }
+
+  function drawLine(arr, color) {
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      if (arr[i] == null) continue;
+      const x = xAt(i, n, plotW, padL);
+      const y = yAt(arr[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  }
+  drawLine(macdLine, "#00d68f");
+  drawLine(signalLine, "#ffa657");
+}
+
+// ---------------- master draw: compute indicators once, render all panels ----------------
+function drawChart(chart) {
+  const closes = chart.close;
+  if (!closes || !closes.length) return;
+
+  const ema15 = calcEMA(closes, 15);
+  const ema50 = calcEMA(closes, 50);
+  const ema200 = calcEMA(closes, 200);
+  const rsi = calcRSI(closes, 14);
+  const { macdLine, signalLine, histogram } = calcMACD(closes, 12, 26, 9);
+  const obv = calcOBV(closes, chart.volume);
+
+  drawPricePanel(chart, ema15, ema50, ema200);
+  drawVolumePanel(chart);
+  drawOBVPanel(obv);
+  drawRSIPanel(rsi);
+  drawMACDPanel(macdLine, signalLine, histogram);
 }
 
 // ---------------- tabs / navigation ----------------
