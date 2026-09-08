@@ -336,7 +336,14 @@ main {
   border: 1px solid var(--border);
   border-radius: var(--radius-m);
   padding: 10px 6px 8px;
-  margin-bottom: 16px;
+  margin-bottom: 10px;
+}
+.chart-panel-label {
+  font-size: 11px;
+  color: var(--text-faint);
+  padding: 0 8px 6px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
 }
 .chart-card canvas { width: 100%; display: block; touch-action: none; }
 .chart-legend { display: flex; gap: 14px; padding: 4px 10px 2px; font-size: 11px; color: var(--text-dim); }
