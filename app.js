@@ -7,7 +7,12 @@ const LS_KEYS = {
   scanList: "vs_scan_list",       // [{symbol, market}]
   watchlist: "vs_watchlist",      // [symbol]
   settings: "vs_settings",        // {earlyTh, strongTh, proxyUrl, defaultRange}
-  cache: "vs_cache_",             // vs_cache_<symbol> -> {ts, chart, fundamentals, signal, range}
+  chartToggles: "vs_chart_toggles", // {candle, ema, bb, volume, obv, rsi, macd}
+  cache: "vs_cache_",             // vs_cache_<symbol> -> {ts, chart, fundamentals, signal, indicators}
+};
+
+const DEFAULT_CHART_TOGGLES = {
+  candle: true, ema: true, bb: false, volume: true, obv: true, rsi: true, macd: true,
 };
 
 const DEFAULT_SETTINGS = {
@@ -32,22 +37,21 @@ const DEFAULT_SCAN_LIST = [
   { symbol: "MSFT", market: "US" },
 ];
 
-const RANGE_TO_INTERVAL = {
-  "1mo": "1d", "3mo": "1d", "6mo": "1d", "1y": "1d",
-};
-
 // ---------------- state ----------------
 let state = {
   settings: loadSettings(),
   scanList: loadJSON(LS_KEYS.scanList, DEFAULT_SCAN_LIST),
   watchlist: loadJSON(LS_KEYS.watchlist, []),
+  chartToggles: Object.assign({}, DEFAULT_CHART_TOGGLES, loadJSON(LS_KEYS.chartToggles, {})),
   currentTab: "scanner",
   currentMarketFilter: "ALL",
   currentSymbol: null,
   currentRange: null,
+  currentDetailData: null,
   isRefreshing: false,
 };
 state.currentRange = state.settings.defaultRange;
+function saveChartToggles() { saveJSON(LS_KEYS.chartToggles, state.chartToggles); }
 
 // ---------------- storage helpers ----------------
 function loadJSON(key, fallback) {
@@ -89,9 +93,13 @@ function buildProxied(url) {
   return p + url;
 }
 
-async function fetchChart(symbol, range) {
-  const interval = RANGE_TO_INTERVAL[range] || "1d";
-  const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}&includePrePost=false`;
+const PERIOD_DAYS = { "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365 };
+
+async function fetchChart(symbol) {
+  // Always pull a full year of daily bars regardless of the display range —
+  // EMA200 / 52-week breakout / etc. need the long history to be meaningful.
+  // The display range selector only slices this same dataset for viewing.
+  const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d&includePrePost=false`;
   const res = await fetch(buildProxied(yUrl));
   if (!res.ok) throw new Error("chart fetch failed: " + res.status);
   const json = await res.json();
@@ -161,20 +169,86 @@ function computeSignal(chart) {
   return { lastClose, lastVol, avgVol, volRatio, pctChange, level, direction: pctChange >= 0 ? "up" : "down" };
 }
 
-// Load (from cache first, then network) a full symbol record
-async function loadSymbolData(symbol, { forceNetwork = false, range = null } = {}) {
-  const r = range || state.currentRange;
+// Compute the full indicator bundle once, over the FULL fetched history.
+// (Display-range slicing happens later, at render time — see sliceForDisplay.)
+function computeIndicators(chart) {
+  const { close, high, low, volume } = chart;
+  const ema15 = calcEMA(close, 15);
+  const ema50 = calcEMA(close, 50);
+  const ema200 = calcEMA(close, 200);
+  const rsi = calcRSI(close, 14);
+  const macd = calcMACD(close, 12, 26, 9);
+  const bollinger = calcBollinger(close, 20, 2.0);
+  const obv = calcOBV(close, volume);
+  const supportResistance = findSupportResistance(high, low, close, 60, 5);
+
+  const bbWidth = bollinger.upper.map((u, i) => {
+    const l = bollinger.lower[i], m = bollinger.middle[i];
+    return (u != null && l != null && m) ? ((u - l) / m) * 100 : null;
+  });
+
+  const signals = detectSignals(close, high, low, volume, ema50, ema200, rsi, macd, bbWidth);
+
+  return { ema15, ema50, ema200, rsi, macd, bollinger, bbWidth, obv, supportResistance, signals };
+}
+
+// Slice both the raw chart and its pre-computed indicators to the same
+// tail window for display, without recomputing anything (EMA/RSI/etc.
+// were already computed on the full 1y series so long-lookback values
+// stay accurate right up to the edge of the visible window).
+function sliceForDisplay(chart, ind, rangeKey) {
+  const ts = chart.timestamps;
+  const n = ts.length;
+  if (!n) return { chart, ind };
+
+  const days = PERIOD_DAYS[rangeKey] || 90;
+  const lastTs = ts[n - 1];
+  const cutoff = lastTs - days * 86400;
+  let start = 0;
+  while (start < n && ts[start] < cutoff) start++;
+  if (start >= n) start = Math.max(0, n - 1);
+
+  const cut = (arr) => (Array.isArray(arr) ? arr.slice(start) : arr);
+  const slicedChart = {
+    meta: chart.meta,
+    timestamps: cut(ts),
+    close: cut(chart.close),
+    open: cut(chart.open),
+    high: cut(chart.high),
+    low: cut(chart.low),
+    volume: cut(chart.volume),
+  };
+  const slicedInd = {
+    ema15: cut(ind.ema15),
+    ema50: cut(ind.ema50),
+    ema200: cut(ind.ema200),
+    rsi: cut(ind.rsi),
+    macd: { macd: cut(ind.macd.macd), signal: cut(ind.macd.signal), histogram: cut(ind.macd.histogram) },
+    bollinger: { upper: cut(ind.bollinger.upper), middle: cut(ind.bollinger.middle), lower: cut(ind.bollinger.lower) },
+    bbWidth: cut(ind.bbWidth),
+    obv: cut(ind.obv),
+    supportResistance: ind.supportResistance, // computed over its own 60-bar lookback, not sliced
+    signals: ind.signals,                     // always reflects the latest full-history reading
+  };
+  return { chart: slicedChart, ind: slicedInd };
+}
+
+// Load (from cache first, then network) a full symbol record.
+// Cache is no longer keyed by display range — we always fetch/keep the
+// full 1y series and slice client-side for whichever range is selected.
+async function loadSymbolData(symbol, { forceNetwork = false } = {}) {
   const cached = getCache(symbol);
-  const fresh = cached && (Date.now() - cached.ts < 5 * 60 * 1000) && cached.range === r;
+  const fresh = cached && (Date.now() - cached.ts < 5 * 60 * 1000);
   if (fresh && !forceNetwork) return { data: cached, fromCache: true };
 
   try {
     const [chart, fundamentals] = await Promise.all([
-      fetchChart(symbol, r),
+      fetchChart(symbol),
       fetchFundamentals(symbol).catch(() => null),
     ]);
     const signal = computeSignal(chart);
-    const record = { chart, fundamentals, signal, range: r };
+    const indicators = computeIndicators(chart);
+    const record = { chart, fundamentals, signal, indicators };
     setCache(symbol, record);
     return { data: Object.assign({ ts: Date.now() }, record), fromCache: false };
   } catch (err) {
@@ -493,6 +567,112 @@ function renderDetailTab(symbol, tab) {
   else if (tab === "dw") renderDetailTabDW(symbol);
 }
 
+// ---------------- signal badges + composite score ----------------
+const SIGNAL_DEFS = [
+  { key: "goldenCross", icon: "🌟", label: "Golden Cross", type: "bull" },
+  { key: "deathCross", icon: "💀", label: "Death Cross", type: "bear" },
+  { key: "rsiOversold", icon: "📉", label: "RSI Oversold", type: "bull" },
+  { key: "rsiOverbought", icon: "📈", label: "RSI Overbought", type: "bear" },
+  { key: "macdBullish", icon: "⚡", label: "MACD Bullish", type: "bull" },
+  { key: "macdBearish", icon: "🔻", label: "MACD Bearish", type: "bear" },
+  { key: "volumeSpike", icon: "🔊", label: "Volume Spike", type: "neu" },
+  { key: "breakout52w", icon: "🚀", label: "52W Breakout", type: "bull" },
+  { key: "bbSqueeze", icon: "🔗", label: "BB Squeeze", type: "neu" },
+  { key: "bullZone", icon: "🐂", label: "Bull Zone", type: "bull" },
+];
+
+function signalBadgesHtml(signals) {
+  const active = SIGNAL_DEFS.filter(s => signals && signals[s.key]);
+  if (!active.length) return `<div class="ratio-note">ไม่มีสัญญาณเด่นในขณะนี้</div>`;
+  return `<div class="signal-badges">` +
+    active.map(s => `<span class="sig-badge sig-${s.type}">${s.icon} ${s.label}</span>`).join("") +
+    `</div>`;
+}
+
+// Aggregate buy-volume % over the last `lookback` bars, using the same
+// (close-low)/(high-low) split used per-bar in the volume panel.
+function computeBuyPct(chart, lookback = 20) {
+  const { high, low, close, volume } = chart;
+  const n = close.length;
+  const start = Math.max(0, n - lookback);
+  let buy = 0, total = 0;
+  for (let i = start; i < n; i++) {
+    if (high[i] == null || low[i] == null || close[i] == null || volume[i] == null) continue;
+    const hl = high[i] - low[i];
+    const bv = hl > 0 ? volume[i] * ((close[i] - low[i]) / hl) : volume[i] / 2;
+    buy += bv;
+    total += volume[i];
+  }
+  return total > 0 ? (buy / total) * 100 : null;
+}
+
+// Composite -8..+8 style score, adapted from the market_terminal_v10
+// scoring model to the data this app has on hand (buyPct/bbPct computed
+// locally since there's no server-side pandas here).
+function computeScore(sig, ind, chart) {
+  const n = chart.close.length;
+  const li = n - 1;
+  if (li < 0) return 0;
+  const lc = chart.close[li];
+  const lrsi = ind.rsi[li];
+  const lm = ind.macd.macd[li], ls = ind.macd.signal[li];
+  const le15 = ind.ema15[li], le50 = ind.ema50[li], le200 = ind.ema200[li];
+  const volRatio = sig ? sig.volRatio : null;
+  const obvUp = (ind.obv[li] != null && ind.obv[li - 1] != null) ? ind.obv[li] > ind.obv[li - 1] : false;
+  const buyPct = computeBuyPct(chart, 20);
+  const bu = ind.bollinger.upper[li], bl = ind.bollinger.lower[li];
+  const bbPct = (bu != null && bl != null && bu !== bl && lc != null) ? ((lc - bl) / (bu - bl)) * 100 : null;
+
+  let score = 0;
+  if (lrsi != null) score += lrsi < 50 ? 1 : -1;
+  if (lm != null && ls != null) score += lm > ls ? 1 : -1;
+  if (lc != null && le15 != null) score += lc > le15 ? 1 : 0;
+  if (lc != null && le50 != null) score += lc > le50 ? 1 : 0;
+  if (lc != null && le200 != null) score += lc > le200 ? 1 : 0;
+  if (volRatio != null && volRatio > 1.5) score += 1;
+  if (obvUp) score += 1;
+  if (buyPct != null) score += buyPct > 55 ? 1 : (buyPct < 45 ? -1 : 0);
+  if (bbPct != null) score += bbPct < 30 ? 1 : (bbPct > 70 ? -1 : 0);
+  return score;
+}
+
+function getVerdict(score) {
+  if (score >= 6) return { label: "STRONG BUY 🚀", color: "#3fb950" };
+  if (score >= 3) return { label: "BUY 📈", color: "#56d364" };
+  if (score >= 0) return { label: "HOLD ⏸", color: "#e3b341" };
+  if (score >= -2) return { label: "SELL 📉", color: "#f85149" };
+  return { label: "STRONG SELL 🔻", color: "#ff3333" };
+}
+
+// ---------------- chart toggles ----------------
+const TOGGLE_DEFS = [
+  { key: "candle", label: "แท่งเทียน" },
+  { key: "ema", label: "EMA" },
+  { key: "bb", label: "BB" },
+  { key: "volume", label: "Volume" },
+  { key: "obv", label: "OBV" },
+  { key: "rsi", label: "RSI" },
+  { key: "macd", label: "MACD" },
+];
+// which panel <div id="panel-…"> each toggle shows/hides (ema & bb are
+// overlays drawn inside the candle panel, so they have no id of their own)
+const TOGGLE_PANEL_ID = { candle: "panel-candle", volume: "panel-volume", obv: "panel-obv", rsi: "panel-rsi", macd: "panel-macd" };
+
+function toggleButtonsHtml() {
+  return `<div class="chart-toggles" id="chartToggles">` +
+    TOGGLE_DEFS.map(t =>
+      `<button data-toggle="${t.key}" class="toggle-btn ${state.chartToggles[t.key] ? "active" : ""}">${t.label}</button>`
+    ).join("") +
+    `</div>`;
+}
+
+function applyPanelVisibility() {
+  Object.entries(TOGGLE_PANEL_ID).forEach(([key, id]) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = state.chartToggles[key] ? "" : "none";
+  });
+}
+
 function renderDetailTabChart(symbol) {
   const data = state.currentDetailData;
   const sig = data.signal;
@@ -500,6 +680,11 @@ function renderDetailTabChart(symbol) {
   const f = data.fundamentals || {};
   const summaryDetail = f.summaryDetail || {};
   const keyStats = f.defaultKeyStatistics || {};
+
+  const hasChart = data.chart && data.chart.close && data.chart.close.length;
+  const ind = data.indicators;
+  const score = hasChart && ind ? computeScore(sig, ind, data.chart) : 0;
+  const verdict = getVerdict(score);
 
   const el = document.getElementById("detailTabContent");
   el.innerHTML = `
@@ -509,8 +694,10 @@ function renderDetailTabChart(symbol) {
       ).join("")}
     </div>
 
-    <div class="chart-card">
-      <div class="chart-panel-label">ราคา (แท่งเทียน) + EMA 15 / 50 / 200</div>
+    ${toggleButtonsHtml()}
+
+    <div class="chart-card" id="panel-candle">
+      <div class="chart-panel-label">ราคา (แท่งเทียน) + EMA / Bollinger Bands</div>
       <canvas id="priceChart"></canvas>
       <div class="chart-legend">
         <span><i class="dot" style="background:var(--accent)"></i>ราคาขึ้น</span>
@@ -521,7 +708,7 @@ function renderDetailTabChart(symbol) {
       </div>
     </div>
 
-    <div class="chart-card">
+    <div class="chart-card" id="panel-volume">
       <div class="chart-panel-label">ปริมาณซื้อขาย (Buy / Sell Volume)</div>
       <canvas id="volChart"></canvas>
       <div class="chart-legend">
@@ -531,23 +718,34 @@ function renderDetailTabChart(symbol) {
       </div>
     </div>
 
-    <div class="chart-card">
+    <div class="chart-card" id="panel-obv">
       <div class="chart-panel-label">OBV (On-Balance Volume)</div>
       <canvas id="obvChart"></canvas>
     </div>
 
-    <div class="chart-card">
+    <div class="chart-card" id="panel-rsi">
       <div class="chart-panel-label">RSI (14)</div>
       <canvas id="rsiChart"></canvas>
     </div>
 
-    <div class="chart-card">
+    <div class="chart-card" id="panel-macd">
       <div class="chart-panel-label">MACD (12, 26, 9)</div>
       <canvas id="macdChart"></canvas>
       <div class="chart-legend">
         <span><i class="dot" style="background:var(--accent)"></i>MACD</span>
         <span><i class="dot" style="background:#ffa657"></i>Signal</span>
       </div>
+    </div>
+
+    <div class="verdict-box" style="border-color:${verdict.color}44;background:${verdict.color}14;">
+      <div class="verdict-label">คะแนนรวมสัญญาณ (${score >= 0 ? "+" : ""}${score})</div>
+      <div class="verdict-value" style="color:${verdict.color}">${verdict.label}</div>
+      <div class="verdict-note">สรุปจากสัญญาณด้านล่างทั้งหมด — ไม่ใช่คำแนะนำการลงทุน ใช้ประกอบการตัดสินใจเท่านั้น</div>
+    </div>
+
+    <div class="panel-block">
+      <h3>สัญญาณที่ตรวจพบ</h3>
+      ${signalBadgesHtml(ind ? ind.signals : null)}
     </div>
 
     <div class="panel-block">
@@ -573,20 +771,36 @@ function renderDetailTabChart(symbol) {
     </div>
   `;
 
-  drawChart(data.chart);
+  applyPanelVisibility();
+  if (hasChart) {
+    const { chart: slicedChart, ind: slicedInd } = sliceForDisplay(data.chart, ind, state.currentRange);
+    drawChart(slicedChart, slicedInd, state.chartToggles);
+  }
+
   document.getElementById("rangeTabs").querySelectorAll("button").forEach(btn => {
-    btn.onclick = async () => {
+    btn.onclick = () => {
       state.currentRange = btn.dataset.range;
       document.getElementById("rangeTabs").querySelectorAll("button").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
-      const canvas = document.getElementById("priceChart");
-      canvas.style.opacity = "0.4";
-      try {
-        const res = await loadSymbolData(symbol, { forceNetwork: true, range: state.currentRange });
-        state.currentDetailData = res.data;
-        drawChart(res.data.chart);
-      } catch (e) { toast("โหลดข้อมูลช่วงเวลานี้ไม่สำเร็จ"); }
-      canvas.style.opacity = "1";
+      // No network call needed — we already hold the full 1y series + indicators.
+      if (hasChart) {
+        const { chart: sc, ind: si } = sliceForDisplay(data.chart, ind, state.currentRange);
+        drawChart(sc, si, state.chartToggles);
+      }
+    };
+  });
+
+  document.getElementById("chartToggles").querySelectorAll("button").forEach(btn => {
+    btn.onclick = () => {
+      const key = btn.dataset.toggle;
+      state.chartToggles[key] = !state.chartToggles[key];
+      saveChartToggles();
+      btn.classList.toggle("active", state.chartToggles[key]);
+      applyPanelVisibility();
+      if (hasChart) {
+        const { chart: sc, ind: si } = sliceForDisplay(data.chart, ind, state.currentRange);
+        drawChart(sc, si, state.chartToggles);
+      }
     };
   });
 }
@@ -727,71 +941,6 @@ function toggleWatch(symbol) {
   }
 }
 
-// ---------------- indicator math (no libs) ----------------
-function calcEMA(values, period) {
-  const out = new Array(values.length).fill(null);
-  const alpha = 2 / (period + 1);
-  let prev = null;
-  for (let i = 0; i < values.length; i++) {
-    const v = values[i];
-    if (v == null) { out[i] = prev; continue; }
-    prev = prev == null ? v : alpha * v + (1 - alpha) * prev;
-    out[i] = prev;
-  }
-  return out;
-}
-
-function calcRSI(values, period = 14) {
-  const out = new Array(values.length).fill(null);
-  let avgGain = null, avgLoss = null;
-  const gains = [], losses = [];
-  for (let i = 1; i < values.length; i++) {
-    const prevV = values[i - 1], v = values[i];
-    if (prevV == null || v == null) { gains.push(0); losses.push(0); continue; }
-    const d = v - prevV;
-    gains.push(Math.max(d, 0));
-    losses.push(Math.max(-d, 0));
-  }
-  for (let i = 0; i < gains.length; i++) {
-    if (avgGain == null) {
-      if (i + 1 < period) continue;
-      const gWin = gains.slice(i + 1 - period, i + 1);
-      const lWin = losses.slice(i + 1 - period, i + 1);
-      avgGain = gWin.reduce((a, b) => a + b, 0) / period;
-      avgLoss = lWin.reduce((a, b) => a + b, 0) / period;
-    } else {
-      avgGain = (avgGain * (period - 1) + gains[i]) / period;
-      avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
-    }
-    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-    out[i + 1] = avgLoss === 0 ? 100 : 100 - 100 / (1 + rs);
-  }
-  return out;
-}
-
-function calcMACD(values, fast = 12, slow = 26, signal = 9) {
-  const emaFast = calcEMA(values, fast);
-  const emaSlow = calcEMA(values, slow);
-  const macdLine = values.map((_, i) =>
-    emaFast[i] != null && emaSlow[i] != null ? emaFast[i] - emaSlow[i] : null
-  );
-  const signalLine = calcEMA(macdLine, signal);
-  const histogram = macdLine.map((v, i) => (v != null && signalLine[i] != null) ? v - signalLine[i] : null);
-  return { macdLine, signalLine, histogram };
-}
-
-function calcOBV(closes, vols) {
-  const out = new Array(closes.length).fill(0);
-  let obv = 0;
-  for (let i = 1; i < closes.length; i++) {
-    if (closes[i] == null || closes[i - 1] == null || vols[i] == null) { out[i] = obv; continue; }
-    if (closes[i] > closes[i - 1]) obv += vols[i];
-    else if (closes[i] < closes[i - 1]) obv -= vols[i];
-    out[i] = obv;
-  }
-  return out;
-}
-
 // ---------------- canvas setup helper ----------------
 function setupCanvas(canvas, cssHeight) {
   const dpr = window.devicePixelRatio || 1;
@@ -809,7 +958,8 @@ function setupCanvas(canvas, cssHeight) {
 function xAt(i, n, plotW, padL) { return padL + (plotW * i) / ((n - 1) || 1); }
 
 function drawGridLines(ctx, cssWidth, top, height, padL, padR, lines) {
-  ctx.strokeStyle = "#1c2130";
+  ctx.strokeStyle = "#2a2e3a";
+  ctx.globalAlpha = 0.5;
   ctx.lineWidth = 1;
   lines.forEach((frac) => {
     const y = top + height * frac;
@@ -818,10 +968,23 @@ function drawGridLines(ctx, cssWidth, top, height, padL, padR, lines) {
     ctx.lineTo(cssWidth - padR, y);
     ctx.stroke();
   });
+  ctx.globalAlpha = 1;
 }
 
-// ---------------- panel: candlestick price + EMA ----------------
-function drawPricePanel(chart, ema15, ema50, ema200) {
+function drawDashedHLine(ctx, y, x0, x1, color, dash = [4, 4]) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.setLineDash(dash);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x0, y);
+  ctx.lineTo(x1, y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------------- panel: candlestick price + EMA + Bollinger + S/R ----------------
+function drawPricePanel(chart, ind, toggles) {
   const canvas = document.getElementById("priceChart");
   if (!canvas) return;
   const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 230);
@@ -830,11 +993,19 @@ function drawPricePanel(chart, ema15, ema50, ema200) {
   const n = closes.length;
   if (!n) return;
 
-  const validHigh = highs.filter(v => v != null);
-  const validLow = lows.filter(v => v != null);
-  if (!validHigh.length) return;
-  const maxP = Math.max(...validHigh);
-  const minP = Math.min(...validLow);
+  const { ema15, ema50, ema200, bollinger, supportResistance } = ind;
+
+  // price range spans candles + (optionally) Bollinger bands so nothing clips off-canvas
+  let candidates = [...highs, ...lows].filter(v => v != null);
+  if (toggles.bb) {
+    candidates = candidates.concat(
+      bollinger.upper.filter(v => v != null),
+      bollinger.lower.filter(v => v != null)
+    );
+  }
+  if (!candidates.length) return;
+  const maxP = Math.max(...candidates);
+  const minP = Math.min(...candidates);
   const range = (maxP - minP) || 1;
 
   const padL = 4, padR = 4, padT = 8, padB = 8;
@@ -844,42 +1015,85 @@ function drawPricePanel(chart, ema15, ema50, ema200) {
   drawGridLines(ctx, cssWidth, padT, plotH, padL, padR, [0, 0.25, 0.5, 0.75, 1]);
 
   const yAt = (p) => padT + plotH - ((p - minP) / range) * plotH;
-  const candleW = Math.max(1.5, (plotW / n) * 0.62);
 
-  for (let i = 0; i < n; i++) {
-    if (opens[i] == null || closes[i] == null || highs[i] == null || lows[i] == null) continue;
-    const x = xAt(i, n, plotW, padL);
-    const up = closes[i] >= opens[i];
-    ctx.strokeStyle = ctx.fillStyle = up ? "#00d68f" : "#ff5c5c";
-    ctx.lineWidth = 1;
-    // wick
-    ctx.beginPath();
-    ctx.moveTo(x, yAt(highs[i]));
-    ctx.lineTo(x, yAt(lows[i]));
-    ctx.stroke();
-    // body
-    const yO = yAt(opens[i]), yC = yAt(closes[i]);
-    const top = Math.min(yO, yC);
-    const h = Math.max(1, Math.abs(yC - yO));
-    ctx.fillRect(x - candleW / 2, top, candleW, h);
-  }
-
-  function drawEmaLine(ema, color) {
-    ctx.beginPath();
-    let started = false;
-    for (let i = 0; i < n; i++) {
-      if (ema[i] == null) continue;
-      const x = xAt(i, n, plotW, padL);
-      const y = yAt(ema[i]);
-      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+  // Bollinger Bands (drawn first, underneath candles)
+  if (toggles.bb) {
+    function drawDashedSeries(arr, color) {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.8;
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < n; i++) {
+        if (arr[i] == null) continue;
+        const x = xAt(i, n, plotW, padL);
+        const y = yAt(arr[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+      }
+      ctx.stroke();
+      ctx.restore();
     }
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.4;
-    ctx.stroke();
+    drawDashedSeries(bollinger.upper, "#8b93a1");
+    drawDashedSeries(bollinger.lower, "#8b93a1");
   }
-  drawEmaLine(ema15, "#ffa657");
-  drawEmaLine(ema50, "#d2a8ff");
-  drawEmaLine(ema200, "#e3b341");
+
+  // Support / resistance levels
+  if (supportResistance) {
+    const { r2, r1, s1, s2 } = supportResistance;
+    const x0 = padL, x1 = cssWidth - padR;
+    if (r2 != null) drawDashedHLine(ctx, yAt(r2), x0, x1, "rgba(255,92,92,0.55)");
+    if (r1 != null) drawDashedHLine(ctx, yAt(r1), x0, x1, "rgba(255,92,92,0.35)");
+    if (s1 != null) drawDashedHLine(ctx, yAt(s1), x0, x1, "rgba(0,214,143,0.35)");
+    if (s2 != null) drawDashedHLine(ctx, yAt(s2), x0, x1, "rgba(0,214,143,0.55)");
+  }
+
+  // POC (Point of Control) — hook for a future volume-profile calc; drawn
+  // only if the caller supplies one (not computed in this app yet).
+  if (ind.poc != null) {
+    drawDashedHLine(ctx, yAt(ind.poc), padL, cssWidth - padR, "#e3b341", [2, 2]);
+  }
+
+  // Candlesticks
+  if (toggles.candle) {
+    const candleW = Math.max(1.5, (plotW / n) * 0.62);
+    for (let i = 0; i < n; i++) {
+      if (opens[i] == null || closes[i] == null || highs[i] == null || lows[i] == null) continue;
+      const x = xAt(i, n, plotW, padL);
+      const up = closes[i] >= opens[i];
+      ctx.strokeStyle = ctx.fillStyle = up ? "#00d68f" : "#ff5c5c";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, yAt(highs[i]));
+      ctx.lineTo(x, yAt(lows[i]));
+      ctx.stroke();
+      const yO = yAt(opens[i]), yC = yAt(closes[i]);
+      const top = Math.min(yO, yC);
+      const h = Math.max(1, Math.abs(yC - yO));
+      ctx.fillRect(x - candleW / 2, top, candleW, h);
+    }
+  }
+
+  // EMA overlays
+  if (toggles.ema) {
+    function drawEmaLine(ema, color) {
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < n; i++) {
+        if (ema[i] == null) continue;
+        const x = xAt(i, n, plotW, padL);
+        const y = yAt(ema[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+    drawEmaLine(ema15, "#ffa657");
+    drawEmaLine(ema50, "#d2a8ff");
+    drawEmaLine(ema200, "#e3b341");
+  }
 }
 
 // ---------------- panel: buy/sell volume (stacked) ----------------
@@ -888,7 +1102,7 @@ function drawVolumePanel(chart) {
   if (!canvas) return;
   const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 100);
 
-  const opens = chart.open, highs = chart.high, lows = chart.low, closes = chart.close, vols = chart.volume;
+  const highs = chart.high, lows = chart.low, closes = chart.close, vols = chart.volume;
   const n = closes.length;
   if (!n) return;
 
@@ -923,13 +1137,7 @@ function drawVolumePanel(chart) {
 
   if (avgV) {
     const y = padT + plotH - (avgV / maxV) * plotH;
-    ctx.strokeStyle = "#5a6172";
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    ctx.moveTo(padL, y);
-    ctx.lineTo(cssWidth - padR, y);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    drawDashedHLine(ctx, y, padL, cssWidth - padR, "#5a6172", [3, 3]);
   }
 }
 
@@ -988,17 +1196,9 @@ function drawRSIPanel(rsi) {
   const plotW = cssWidth - padL - padR;
   const yAt = (v) => padT + plotH - (v / 100) * plotH;
 
-  [[70, "#ff5c5c"], [50, "#3a4050"], [30, "#00d68f"]].forEach(([level, color]) => {
-    ctx.strokeStyle = color;
-    ctx.globalAlpha = 0.55;
-    ctx.setLineDash(level === 50 ? [3, 3] : []);
-    ctx.beginPath();
-    ctx.moveTo(padL, yAt(level));
-    ctx.lineTo(cssWidth - padR, yAt(level));
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.globalAlpha = 1;
-  });
+  drawDashedHLine(ctx, yAt(70), padL, cssWidth - padR, "rgba(255,92,92,0.55)");
+  drawDashedHLine(ctx, yAt(50), padL, cssWidth - padR, "rgba(58,64,80,0.9)", [3, 3]);
+  drawDashedHLine(ctx, yAt(30), padL, cssWidth - padR, "rgba(0,214,143,0.55)");
 
   ctx.beginPath();
   let started = false;
@@ -1014,11 +1214,12 @@ function drawRSIPanel(rsi) {
 }
 
 // ---------------- panel: MACD ----------------
-function drawMACDPanel(macdLine, signalLine, histogram) {
+function drawMACDPanel(macd) {
   const canvas = document.getElementById("macdChart");
   if (!canvas) return;
   const { ctx, cssWidth, cssHeight } = setupCanvas(canvas, 90);
 
+  const { macd: macdLine, signal: signalLine, histogram } = macd;
   const n = macdLine.length;
   if (!n) return;
   const vals = [...macdLine, ...signalLine, ...histogram].filter(v => v != null);
@@ -1063,23 +1264,21 @@ function drawMACDPanel(macdLine, signalLine, histogram) {
   drawLine(signalLine, "#ffa657");
 }
 
-// ---------------- master draw: compute indicators once, render all panels ----------------
-function drawChart(chart) {
-  const closes = chart.close;
-  if (!closes || !closes.length) return;
+// ---------------- master draw: render whichever panels are toggled on ----------------
+// `chart` and `ind` are expected to already be sliced to the display range
+// (see sliceForDisplay) and `ind` to be the pre-computed indicator bundle
+// from computeIndicators(). Both come from the symbol's cached record so
+// nothing here re-fetches or re-computes anything.
+function drawChart(chart, ind, toggles) {
+  if (!chart || !chart.close || !chart.close.length || !ind) return;
 
-  const ema15 = calcEMA(closes, 15);
-  const ema50 = calcEMA(closes, 50);
-  const ema200 = calcEMA(closes, 200);
-  const rsi = calcRSI(closes, 14);
-  const { macdLine, signalLine, histogram } = calcMACD(closes, 12, 26, 9);
-  const obv = calcOBV(closes, chart.volume);
-
-  drawPricePanel(chart, ema15, ema50, ema200);
-  drawVolumePanel(chart);
-  drawOBVPanel(obv);
-  drawRSIPanel(rsi);
-  drawMACDPanel(macdLine, signalLine, histogram);
+  if (toggles.candle || toggles.ema || toggles.bb) {
+    drawPricePanel(chart, ind, toggles);
+  }
+  if (toggles.volume) drawVolumePanel(chart);
+  if (toggles.obv) drawOBVPanel(ind.obv);
+  if (toggles.rsi) drawRSIPanel(ind.rsi);
+  if (toggles.macd) drawMACDPanel(ind.macd);
 }
 
 // ---------------- tabs / navigation ----------------
@@ -1251,12 +1450,14 @@ function init() {
   renderScanner();
 
   window.addEventListener("resize", () => {
+    const data = state.currentDetailData;
     if (
       document.getElementById("view-detail").classList.contains("active") &&
       state.currentDetailTab === "chart" &&
-      state.currentDetailData && state.currentDetailData.chart
+      data && data.chart && data.chart.close && data.chart.close.length && data.indicators
     ) {
-      drawChart(state.currentDetailData.chart);
+      const { chart: sc, ind: si } = sliceForDisplay(data.chart, data.indicators, state.currentRange);
+      drawChart(sc, si, state.chartToggles);
     }
   });
 }

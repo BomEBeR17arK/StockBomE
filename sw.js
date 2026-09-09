@@ -3,13 +3,14 @@
 // Live data calls (Yahoo Finance via proxy) are left to the network — the app
 // itself falls back to its own localStorage cache when those fail.
 
-const CACHE_NAME = "stockbome-shell-v2";
+const CACHE_NAME = "stockbome-shell-v3";
 const SHELL_FILES = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
   "./api-adapters.js",
+  "./indicators.js",
   "./manifest.json",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
