@@ -12,7 +12,7 @@ const LS_KEYS = {
 };
 
 const DEFAULT_CHART_TOGGLES = {
-  candle: true, ema: true, bb: false, volume: true, obv: true, rsi: true, macd: true,
+  candle: true, ema: true, bb: false, vwap: true, volume: true, obv: true, rsi: true, macd: true,
 };
 
 const DEFAULT_SETTINGS = {
@@ -95,11 +95,8 @@ function buildProxied(url) {
 
 const PERIOD_DAYS = { "1mo": 30, "3mo": 90, "6mo": 180, "1y": 365 };
 
-async function fetchChart(symbol) {
-  // Always pull a full year of daily bars regardless of the display range —
-  // EMA200 / 52-week breakout / etc. need the long history to be meaningful.
-  // The display range selector only slices this same dataset for viewing.
-  const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1y&interval=1d&includePrePost=false`;
+async function fetchYahooChart(symbol, range, interval) {
+  const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}&includePrePost=false`;
   const res = await fetch(buildProxied(yUrl));
   if (!res.ok) throw new Error("chart fetch failed: " + res.status);
   const json = await res.json();
@@ -119,6 +116,20 @@ async function fetchChart(symbol) {
   };
 }
 
+async function fetchChart(symbol) {
+  // Always pull a full year of daily bars regardless of the display range —
+  // EMA200 / 52-week breakout / etc. need the long history to be meaningful.
+  // The display range selector only slices this same dataset for viewing.
+  return fetchYahooChart(symbol, "1y", "1d");
+}
+
+// Weekly bars for a simple multi-timeframe confirmation check (see
+// computeWeeklyBias). 2y of weekly bars gives enough history for a
+// weekly EMA20/RSI14 reading.
+async function fetchWeeklyChart(symbol) {
+  return fetchYahooChart(symbol, "2y", "1wk");
+}
+
 async function fetchFundamentals(symbol) {
   const modules = "summaryDetail,defaultKeyStatistics,financialData,price";
   const yUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}`;
@@ -128,6 +139,26 @@ async function fetchFundamentals(symbol) {
   const result = json && json.quoteSummary && json.quoteSummary.result && json.quoteSummary.result[0];
   if (!result) throw new Error("no fundamentals data");
   return result;
+}
+
+// Simple weekly bias: is price above/below its own 20-week EMA, and what's
+// weekly RSI doing. Used only to flag daily-vs-weekly disagreement — this
+// isn't meant to replace a real multi-timeframe analysis, just a quick
+// "is the bigger trend fighting this daily signal?" sanity check.
+function computeWeeklyBias(weeklyChart) {
+  if (!weeklyChart || !weeklyChart.close || weeklyChart.close.length < 20) return null;
+  const closes = weeklyChart.close;
+  const ema20 = calcEMA(closes, 20);
+  const rsi = calcRSI(closes, 14);
+  const li = closes.length - 1;
+  const lc = closes[li], le = ema20[li], lr = rsi[li];
+  if (lc == null || le == null) return null;
+  return {
+    bias: lc > le ? "bullish" : "bearish",
+    close: lc,
+    ema20: le,
+    rsi: lr,
+  };
 }
 
 function rawNum(field) {
@@ -180,6 +211,8 @@ function computeIndicators(chart) {
   const macd = calcMACD(close, 12, 26, 9);
   const bollinger = calcBollinger(close, 20, 2.0);
   const obv = calcOBV(close, volume);
+  const vwap = calcVWAP(high, low, close, volume, 20);
+  const atr = calcATR(high, low, close, 14);
   const supportResistance = findSupportResistance(high, low, close, 60, 5);
 
   const bbWidth = bollinger.upper.map((u, i) => {
@@ -189,7 +222,7 @@ function computeIndicators(chart) {
 
   const signals = detectSignals(close, high, low, volume, ema50, ema200, rsi, macd, bbWidth);
 
-  return { ema15, ema50, ema200, rsi, macd, bollinger, bbWidth, obv, supportResistance, signals };
+  return { ema15, ema50, ema200, rsi, macd, bollinger, bbWidth, obv, vwap, atr, supportResistance, signals };
 }
 
 // Slice both the raw chart and its pre-computed indicators to the same
@@ -227,6 +260,8 @@ function sliceForDisplay(chart, ind, rangeKey) {
     bollinger: { upper: cut(ind.bollinger.upper), middle: cut(ind.bollinger.middle), lower: cut(ind.bollinger.lower) },
     bbWidth: cut(ind.bbWidth),
     obv: cut(ind.obv),
+    vwap: cut(ind.vwap),
+    atr: cut(ind.atr),
     supportResistance: ind.supportResistance, // computed over its own 60-bar lookback, not sliced
     signals: ind.signals,                     // always reflects the latest full-history reading
   };
@@ -242,13 +277,15 @@ async function loadSymbolData(symbol, { forceNetwork = false } = {}) {
   if (fresh && !forceNetwork) return { data: cached, fromCache: true };
 
   try {
-    const [chart, fundamentals] = await Promise.all([
+    const [chart, fundamentals, weeklyChart] = await Promise.all([
       fetchChart(symbol),
       fetchFundamentals(symbol).catch(() => null),
+      fetchWeeklyChart(symbol).catch(() => null),
     ]);
     const signal = computeSignal(chart);
     const indicators = computeIndicators(chart);
-    const record = { chart, fundamentals, signal, indicators };
+    const weeklyBias = computeWeeklyBias(weeklyChart);
+    const record = { chart, fundamentals, signal, indicators, weeklyBias };
     setCache(symbol, record);
     return { data: Object.assign({ ts: Date.now() }, record), fromCache: false };
   } catch (err) {
@@ -569,8 +606,10 @@ function renderDetailTab(symbol, tab) {
 
 // ---------------- signal badges + composite score ----------------
 const SIGNAL_DEFS = [
-  { key: "goldenCross", icon: "🌟", label: "Golden Cross", type: "bull" },
-  { key: "deathCross", icon: "💀", label: "Death Cross", type: "bear" },
+  { key: "goldenCross", icon: "🌟", label: "Golden Cross (เพิ่งตัดขึ้น)", type: "bull" },
+  { key: "deathCross", icon: "💀", label: "Death Cross (เพิ่งตัดลง)", type: "bear" },
+  { key: "emaBullish", icon: "📶", label: "แนวโน้ม EMA ขาขึ้น", type: "bull" },
+  { key: "emaBearish", icon: "📶", label: "แนวโน้ม EMA ขาลง", type: "bear" },
   { key: "rsiOversold", icon: "📉", label: "RSI Oversold", type: "bull" },
   { key: "rsiOverbought", icon: "📈", label: "RSI Overbought", type: "bear" },
   { key: "macdBullish", icon: "⚡", label: "MACD Bullish", type: "bull" },
@@ -616,6 +655,7 @@ function computeScore(sig, ind, chart) {
   const lc = chart.close[li];
   const lrsi = ind.rsi[li];
   const lm = ind.macd.macd[li], ls = ind.macd.signal[li];
+  const latr = ind.atr ? ind.atr[li] : null;
   const le15 = ind.ema15[li], le50 = ind.ema50[li], le200 = ind.ema200[li];
   const volRatio = sig ? sig.volRatio : null;
   const obvUp = (ind.obv[li] != null && ind.obv[li - 1] != null) ? ind.obv[li] > ind.obv[li - 1] : false;
@@ -624,8 +664,16 @@ function computeScore(sig, ind, chart) {
   const bbPct = (bu != null && bl != null && bu !== bl && lc != null) ? ((lc - bl) / (bu - bl)) * 100 : null;
 
   let score = 0;
-  if (lrsi != null) score += lrsi < 50 ? 1 : -1;
-  if (lm != null && ls != null) score += lm > ls ? 1 : -1;
+  // RSI & MACD contribute continuously (scaled -1..+1) rather than a flat
+  // ±1 step, so e.g. RSI 8 (deeply oversold) counts for more than RSI 29
+  // (barely oversold) — magnitude, not just which side of the line it's on.
+  if (lrsi != null) {
+    score += clamp((50 - lrsi) / 50, -1, 1);
+  }
+  if (lm != null && ls != null) {
+    const scale = (latr && latr > 0) ? latr : (Math.abs(lc || 1) * 0.01);
+    score += clamp((lm - ls) / (scale || 1), -1, 1);
+  }
   if (lc != null && le15 != null) score += lc > le15 ? 1 : 0;
   if (lc != null && le50 != null) score += lc > le50 ? 1 : 0;
   if (lc != null && le200 != null) score += lc > le200 ? 1 : 0;
@@ -635,6 +683,8 @@ function computeScore(sig, ind, chart) {
   if (bbPct != null) score += bbPct < 30 ? 1 : (bbPct > 70 ? -1 : 0);
   return score;
 }
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 function getVerdict(score) {
   if (score >= 6) return { label: "STRONG BUY 🚀", color: "#3fb950" };
@@ -649,14 +699,19 @@ const TOGGLE_DEFS = [
   { key: "candle", label: "แท่งเทียน" },
   { key: "ema", label: "EMA" },
   { key: "bb", label: "BB" },
+  { key: "vwap", label: "VWAP" },
   { key: "volume", label: "Volume" },
   { key: "obv", label: "OBV" },
   { key: "rsi", label: "RSI" },
   { key: "macd", label: "MACD" },
 ];
-// which panel <div id="panel-…"> each toggle shows/hides (ema & bb are
-// overlays drawn inside the candle panel, so they have no id of their own)
-const TOGGLE_PANEL_ID = { candle: "panel-candle", volume: "panel-volume", obv: "panel-obv", rsi: "panel-rsi", macd: "panel-macd" };
+// Only toggles that own a dedicated <div id="panel-…"> get shown/hidden as
+// a whole container. "candle" / "ema" / "bb" / "vwap" are all layers drawn
+// inside the SAME price-panel canvas — toggling one off must not hide the
+// other two, so the price panel's own visibility is handled separately
+// (see applyPanelVisibility: it's visible whenever any of those 4 is on).
+const TOGGLE_PANEL_ID = { volume: "panel-volume", obv: "panel-obv", rsi: "panel-rsi", macd: "panel-macd" };
+const PRICE_PANEL_LAYER_TOGGLES = ["candle", "ema", "bb", "vwap"];
 
 function toggleButtonsHtml() {
   return `<div class="chart-toggles" id="chartToggles">` +
@@ -671,6 +726,11 @@ function applyPanelVisibility() {
     const el = document.getElementById(id);
     if (el) el.style.display = state.chartToggles[key] ? "" : "none";
   });
+  const priceEl = document.getElementById("panel-candle");
+  if (priceEl) {
+    const anyLayerOn = PRICE_PANEL_LAYER_TOGGLES.some(k => state.chartToggles[k]);
+    priceEl.style.display = anyLayerOn ? "" : "none";
+  }
 }
 
 function renderDetailTabChart(symbol) {
@@ -686,6 +746,63 @@ function renderDetailTabChart(symbol) {
   const score = hasChart && ind ? computeScore(sig, ind, data.chart) : 0;
   const verdict = getVerdict(score);
 
+  // ATR-based stop-loss context (not investment advice — just a common
+  // volatility-sizing rule of thumb: entry - 1.5x ATR).
+  let atrBlockHtml = "";
+  if (hasChart && ind && ind.atr) {
+    const li = data.chart.close.length - 1;
+    const atrVal = ind.atr[li];
+    const lc = data.chart.close[li];
+    if (atrVal != null && lc != null) {
+      const dp = lc >= 100 ? 1 : 2;
+      const stopSuggest = lc - 1.5 * atrVal;
+      const atrPct = (atrVal / lc) * 100;
+      atrBlockHtml = `
+        <div class="panel-block">
+          <h3>ความผันผวน (ATR 14)</h3>
+          <div class="metric-grid">
+            <div class="metric"><span class="k">ATR (14)</span><span class="v mono">${atrVal.toFixed(dp)}</span></div>
+            <div class="metric"><span class="k">ATR % ของราคา</span><span class="v mono">${atrPct.toFixed(2)}%</span></div>
+          </div>
+          <div class="ratio-note" style="margin-top:10px;">อ้างอิงคร่าวๆ สำหรับตั้ง Stop Loss แบบ 1.5x ATR: ประมาณ <b style="color:var(--text)">${stopSuggest.toFixed(dp)}</b> — เป็นแนวทางทั่วไป ไม่ใช่คำแนะนำการลงทุน ควรพิจารณาแนวรับ/ต้านจริงร่วมด้วย</div>
+        </div>`;
+    }
+  }
+
+  // Multi-timeframe confirmation: does the weekly trend agree with the
+  // daily signal, or is this daily setup fighting the bigger trend?
+  let mtfBlockHtml = "";
+  if (ind && ind.signals) {
+    const dailyBull = ind.signals.emaBullish;
+    const dailyBear = ind.signals.emaBearish;
+    const dailyLabel = dailyBull ? "1D: ขาขึ้น" : dailyBear ? "1D: ขาลง" : "1D: ไม่ชัดเจน";
+    const dailyType = dailyBull ? "sig-bull" : dailyBear ? "sig-bear" : "sig-neu";
+
+    const wb = data.weeklyBias;
+    let weeklyLabel = "1W: ไม่มีข้อมูล";
+    let weeklyType = "sig-neu";
+    let note = "ข้อมูลรายสัปดาห์ไม่พอสำหรับเทียบแนวโน้ม";
+    if (wb) {
+      weeklyLabel = wb.bias === "bullish" ? "1W: ขาขึ้น" : "1W: ขาลง";
+      weeklyType = wb.bias === "bullish" ? "sig-bull" : "sig-bear";
+      const dailyDir = dailyBull ? "bullish" : dailyBear ? "bearish" : null;
+      if (dailyDir && dailyDir === wb.bias) {
+        note = "แนวโน้มรายวันกับรายสัปดาห์สอดคล้องกัน — สัญญาณรายวันมีน้ำหนักมากขึ้น";
+      } else if (dailyDir) {
+        note = "⚠️ แนวโน้มรายวันกับรายสัปดาห์ไม่ตรงกัน — สัญญาณรายวันอาจเป็นสัญญาณสวนเทรนด์หลัก ควรระวังสัญญาณหลอก";
+      }
+    }
+    mtfBlockHtml = `
+      <div class="panel-block">
+        <h3>Multi-Timeframe</h3>
+        <div class="signal-badges">
+          <span class="sig-badge ${dailyType}">${dailyLabel}</span>
+          <span class="sig-badge ${weeklyType}">${weeklyLabel}</span>
+        </div>
+        <div class="ratio-note" style="margin-top:8px;">${note}</div>
+      </div>`;
+  }
+
   const el = document.getElementById("detailTabContent");
   el.innerHTML = `
     <div class="range-tabs" id="rangeTabs">
@@ -697,7 +814,7 @@ function renderDetailTabChart(symbol) {
     ${toggleButtonsHtml()}
 
     <div class="chart-card" id="panel-candle">
-      <div class="chart-panel-label">ราคา (แท่งเทียน) + EMA / Bollinger Bands</div>
+      <div class="chart-panel-label">ราคา (แท่งเทียน) + EMA / VWAP / Bollinger Bands</div>
       <canvas id="priceChart"></canvas>
       <div class="chart-legend">
         <span><i class="dot" style="background:var(--accent)"></i>ราคาขึ้น</span>
@@ -705,6 +822,7 @@ function renderDetailTabChart(symbol) {
         <span><i class="dot" style="background:#ffa657"></i>EMA15</span>
         <span><i class="dot" style="background:#d2a8ff"></i>EMA50</span>
         <span><i class="dot" style="background:#e3b341"></i>EMA200</span>
+        <span><i class="dot" style="background:#58a6ff"></i>VWAP(20)</span>
       </div>
     </div>
 
@@ -716,6 +834,7 @@ function renderDetailTabChart(symbol) {
         <span><i class="dot" style="background:var(--danger)"></i>แรงขาย</span>
         <span><i class="dot" style="background:#3a4050"></i>เส้นเฉลี่ย</span>
       </div>
+      <div class="ratio-note" style="padding:0 8px 6px;">⚠️ ประมาณจากตำแหน่งราคาปิดในกรอบ high-low ของแต่ละแท่ง ไม่ใช่ข้อมูล order flow จริง</div>
     </div>
 
     <div class="chart-card" id="panel-obv">
@@ -738,7 +857,7 @@ function renderDetailTabChart(symbol) {
     </div>
 
     <div class="verdict-box" style="border-color:${verdict.color}44;background:${verdict.color}14;">
-      <div class="verdict-label">คะแนนรวมสัญญาณ (${score >= 0 ? "+" : ""}${score})</div>
+      <div class="verdict-label">คะแนนรวมสัญญาณ (${score >= 0 ? "+" : ""}${score.toFixed(1)})</div>
       <div class="verdict-value" style="color:${verdict.color}">${verdict.label}</div>
       <div class="verdict-note">สรุปจากสัญญาณด้านล่างทั้งหมด — ไม่ใช่คำแนะนำการลงทุน ใช้ประกอบการตัดสินใจเท่านั้น</div>
     </div>
@@ -747,6 +866,8 @@ function renderDetailTabChart(symbol) {
       <h3>สัญญาณที่ตรวจพบ</h3>
       ${signalBadgesHtml(ind ? ind.signals : null)}
     </div>
+
+    ${mtfBlockHtml}
 
     <div class="panel-block">
       <h3>สัญญาณปริมาณซื้อขาย</h3>
@@ -758,6 +879,8 @@ function renderDetailTabChart(symbol) {
       </div>
       <div class="ratio-note" style="margin-top:10px;">${interpretVolSignal(sig)}</div>
     </div>
+
+    ${atrBlockHtml}
 
     <div class="panel-block">
       <h3>อัตราส่วนมูลค่า (อ่านค่าให้อัตโนมัติ)</h3>
@@ -993,9 +1116,13 @@ function drawPricePanel(chart, ind, toggles) {
   const n = closes.length;
   if (!n) return;
 
-  const { ema15, ema50, ema200, bollinger, supportResistance } = ind;
+  const { ema15, ema50, ema200, bollinger, vwap, supportResistance } = ind;
 
-  // price range spans candles + (optionally) Bollinger bands so nothing clips off-canvas
+  // Price range must cover EVERYTHING that's about to be drawn — candles,
+  // Bollinger (if on), VWAP (if on), AND the support/resistance + POC lines
+  // (which draw unconditionally). Previously S/R levels outside the
+  // candle/BB range would be drawn at an off-canvas y — this always
+  // widens the range to fit them instead.
   let candidates = [...highs, ...lows].filter(v => v != null);
   if (toggles.bb) {
     candidates = candidates.concat(
@@ -1003,16 +1130,28 @@ function drawPricePanel(chart, ind, toggles) {
       bollinger.lower.filter(v => v != null)
     );
   }
+  if (toggles.vwap && vwap) {
+    candidates = candidates.concat(vwap.filter(v => v != null));
+  }
+  if (supportResistance) {
+    [supportResistance.r2, supportResistance.r1, supportResistance.s1, supportResistance.s2]
+      .forEach(v => { if (v != null) candidates.push(v); });
+  }
+  if (ind.poc != null) candidates.push(ind.poc);
   if (!candidates.length) return;
+
   const maxP = Math.max(...candidates);
   const minP = Math.min(...candidates);
   const range = (maxP - minP) || 1;
 
-  const padL = 4, padR = 4, padT = 8, padB = 8;
+  // Reserve room on the right for price-axis labels and at the bottom for
+  // date ticks (previously the chart had no axis labels at all).
+  const padL = 4, padR = 42, padT = 8, padB = 18;
   const plotH = cssHeight - padT - padB;
   const plotW = cssWidth - padL - padR;
 
-  drawGridLines(ctx, cssWidth, padT, plotH, padL, padR, [0, 0.25, 0.5, 0.75, 1]);
+  const gridFracs = [0, 0.25, 0.5, 0.75, 1];
+  drawGridLines(ctx, cssWidth, padT, plotH, padL, padR, gridFracs);
 
   const yAt = (p) => padT + plotH - ((p - minP) / range) * plotH;
 
@@ -1094,6 +1233,55 @@ function drawPricePanel(chart, ind, toggles) {
     drawEmaLine(ema50, "#d2a8ff");
     drawEmaLine(ema200, "#e3b341");
   }
+
+  // VWAP overlay (rolling 20-bar, see calcVWAP comment for why not a
+  // classic session VWAP)
+  if (toggles.vwap && vwap) {
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      if (vwap[i] == null) continue;
+      const x = xAt(i, n, plotW, padL);
+      const y = yAt(vwap[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    }
+    ctx.strokeStyle = "#58a6ff";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  }
+
+  // ---- axis labels (price on the right, dates along the bottom) ----
+  const dp = maxP >= 100 ? 1 : 2;
+  ctx.save();
+  ctx.font = "9px SFMono-Regular, Consolas, monospace";
+  ctx.fillStyle = "#5a6172";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  gridFracs.forEach((frac) => {
+    const price = maxP - frac * range;
+    const y = padT + plotH * frac;
+    ctx.fillText(price.toFixed(dp), cssWidth - padR + 4, y);
+  });
+  ctx.restore();
+
+  if (chart.timestamps && chart.timestamps.length === n) {
+    ctx.save();
+    ctx.font = "9px SFMono-Regular, Consolas, monospace";
+    ctx.fillStyle = "#5a6172";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    const tickCount = Math.min(5, n);
+    for (let t = 0; t < tickCount; t++) {
+      const i = tickCount === 1 ? 0 : Math.round((t / (tickCount - 1)) * (n - 1));
+      const ts = chart.timestamps[i];
+      if (ts == null) continue;
+      const d = new Date(ts * 1000);
+      const label = `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`;
+      const x = xAt(i, n, plotW, padL);
+      ctx.fillText(label, Math.min(Math.max(x, padL + 12), cssWidth - padR - 12), padT + plotH + 4);
+    }
+    ctx.restore();
+  }
 }
 
 // ---------------- panel: buy/sell volume (stacked) ----------------
@@ -1119,7 +1307,8 @@ function drawVolumePanel(chart) {
   const validVols = vols.filter(v => v != null);
   const avgV = validVols.length ? validVols.reduce((a, b) => a + b, 0) / validVols.length : 0;
 
-  const padL = 4, padR = 4, padT = 6, padB = 6;
+  // padR matches drawPricePanel so bars line up under the same candle
+  const padL = 4, padR = 42, padT = 6, padB = 6;
   const plotH = cssHeight - padT - padB;
   const plotW = cssWidth - padL - padR;
   const barW = Math.max(1.5, (plotW / n) * 0.62);
@@ -1139,6 +1328,15 @@ function drawVolumePanel(chart) {
     const y = padT + plotH - (avgV / maxV) * plotH;
     drawDashedHLine(ctx, y, padL, cssWidth - padR, "#5a6172", [3, 3]);
   }
+
+  ctx.save();
+  ctx.font = "9px SFMono-Regular, Consolas, monospace";
+  ctx.fillStyle = "#5a6172";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(fmtVol(maxV), cssWidth - padR + 4, padT);
+  if (avgV) ctx.fillText("avg " + fmtVol(avgV), cssWidth - padR + 4, padT + plotH - (avgV / maxV) * plotH);
+  ctx.restore();
 }
 
 // ---------------- panel: OBV ----------------
@@ -1152,7 +1350,7 @@ function drawOBVPanel(obv) {
   const minO = Math.min(...obv), maxO = Math.max(...obv);
   const range = (maxO - minO) || 1;
 
-  const padL = 4, padR = 4, padT = 6, padB = 6;
+  const padL = 4, padR = 42, padT = 6, padB = 6;
   const plotH = cssHeight - padT - padB;
   const plotW = cssWidth - padL - padR;
   const yAt = (v) => padT + plotH - ((v - minO) / range) * plotH;
@@ -1181,6 +1379,15 @@ function drawOBVPanel(obv) {
   ctx.strokeStyle = "#00d68f";
   ctx.lineWidth = 1.6;
   ctx.stroke();
+
+  ctx.save();
+  ctx.font = "9px SFMono-Regular, Consolas, monospace";
+  ctx.fillStyle = "#5a6172";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(fmtVol(maxO), cssWidth - padR + 4, padT);
+  ctx.fillText(fmtVol(minO), cssWidth - padR + 4, padT + plotH);
+  ctx.restore();
 }
 
 // ---------------- panel: RSI ----------------
@@ -1191,7 +1398,7 @@ function drawRSIPanel(rsi) {
 
   const n = rsi.length;
   if (!n) return;
-  const padL = 4, padR = 4, padT = 6, padB = 6;
+  const padL = 4, padR = 42, padT = 6, padB = 6;
   const plotH = cssHeight - padT - padB;
   const plotW = cssWidth - padL - padR;
   const yAt = (v) => padT + plotH - (v / 100) * plotH;
@@ -1211,6 +1418,16 @@ function drawRSIPanel(rsi) {
   ctx.strokeStyle = "#ffa657";
   ctx.lineWidth = 1.6;
   ctx.stroke();
+
+  ctx.save();
+  ctx.font = "9px SFMono-Regular, Consolas, monospace";
+  ctx.fillStyle = "#5a6172";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  [[70, "70"], [50, "50"], [30, "30"]].forEach(([level, label]) => {
+    ctx.fillText(label, cssWidth - padR + 4, yAt(level));
+  });
+  ctx.restore();
 }
 
 // ---------------- panel: MACD ----------------
@@ -1226,7 +1443,7 @@ function drawMACDPanel(macd) {
   if (!vals.length) return;
   const maxAbs = Math.max(...vals.map(v => Math.abs(v)), 1e-9);
 
-  const padL = 4, padR = 4, padT = 6, padB = 6;
+  const padL = 4, padR = 42, padT = 6, padB = 6;
   const plotH = cssHeight - padT - padB;
   const plotW = cssWidth - padL - padR;
   const midY = padT + plotH / 2;
@@ -1262,6 +1479,14 @@ function drawMACDPanel(macd) {
   }
   drawLine(macdLine, "#00d68f");
   drawLine(signalLine, "#ffa657");
+
+  ctx.save();
+  ctx.font = "9px SFMono-Regular, Consolas, monospace";
+  ctx.fillStyle = "#5a6172";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText("0", cssWidth - padR + 4, midY);
+  ctx.restore();
 }
 
 // ---------------- master draw: render whichever panels are toggled on ----------------
@@ -1272,7 +1497,7 @@ function drawMACDPanel(macd) {
 function drawChart(chart, ind, toggles) {
   if (!chart || !chart.close || !chart.close.length || !ind) return;
 
-  if (toggles.candle || toggles.ema || toggles.bb) {
+  if (toggles.candle || toggles.ema || toggles.bb || toggles.vwap) {
     drawPricePanel(chart, ind, toggles);
   }
   if (toggles.volume) drawVolumePanel(chart);

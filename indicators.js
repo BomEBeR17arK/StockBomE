@@ -193,6 +193,90 @@ function calcOBV(close, volume) {
 }
 
 /**
+ * Rolling (anchored-window) Volume-Weighted Average Price.
+ * NOTE: this app only has daily bars, so a classic *intraday session*
+ * VWAP doesn't apply — this is a rolling VWAP over the trailing
+ * `period` bars, which is the common adaptation used on daily/swing
+ * charts (resets its window every bar rather than every session).
+ * @param {(number|null)[]} high
+ * @param {(number|null)[]} low
+ * @param {(number|null)[]} close
+ * @param {(number|null)[]} volume
+ * @param {number} period
+ * @returns {(number|null)[]}
+ */
+function calcVWAP(high, low, close, volume, period = 20) {
+  const n = close.length;
+  const out = new Array(n).fill(null);
+  const tpv = new Array(n).fill(0);   // typical-price * volume, per bar
+  const vol = new Array(n).fill(0);
+
+  for (let i = 0; i < n; i++) {
+    if (high[i] == null || low[i] == null || close[i] == null || volume[i] == null) continue;
+    const tp = (high[i] + low[i] + close[i]) / 3;
+    tpv[i] = tp * volume[i];
+    vol[i] = volume[i];
+  }
+
+  let sumTPV = 0, sumVol = 0;
+  const bufTPV = [], bufVol = [];
+  for (let i = 0; i < n; i++) {
+    bufTPV.push(tpv[i]); bufVol.push(vol[i]);
+    sumTPV += tpv[i]; sumVol += vol[i];
+    if (bufTPV.length > period) {
+      sumTPV -= bufTPV.shift();
+      sumVol -= bufVol.shift();
+    }
+    if (bufTPV.length === period && sumVol > 0) {
+      out[i] = sumTPV / sumVol;
+    }
+  }
+  return out;
+}
+
+/**
+ * Average True Range (Wilder's smoothing) — a volatility measure
+ * commonly used to size stop-losses (e.g. entry - 1.5*ATR).
+ * True Range = max(high-low, |high-prevClose|, |low-prevClose|).
+ * First `period` values are null (needs `period` true-range samples).
+ * @param {(number|null)[]} high
+ * @param {(number|null)[]} low
+ * @param {(number|null)[]} close
+ * @param {number} period
+ * @returns {(number|null)[]}
+ */
+function calcATR(high, low, close, period = 14) {
+  const n = close.length;
+  const out = new Array(n).fill(null);
+  if (n < 2) return out;
+
+  const tr = new Array(n).fill(null);
+  for (let i = 1; i < n; i++) {
+    if (high[i] == null || low[i] == null || close[i - 1] == null) continue;
+    tr[i] = Math.max(
+      high[i] - low[i],
+      Math.abs(high[i] - close[i - 1]),
+      Math.abs(low[i] - close[i - 1])
+    );
+  }
+
+  let avg = null;
+  for (let i = 1; i < n; i++) {
+    if (tr[i] == null) continue;
+    if (avg == null) {
+      if (i < period) continue;
+      const win = tr.slice(i - period + 1, i + 1).filter(v => v != null);
+      if (win.length < period) continue;
+      avg = win.reduce((a, b) => a + b, 0) / period;
+    } else {
+      avg = (avg * (period - 1) + tr[i]) / period;
+    }
+    out[i] = avg;
+  }
+  return out;
+}
+
+/**
  * Key support/resistance levels from recent price action.
  * r2 = highest high in the lookback window.
  * r1 = the `topN`-th largest high (i.e. `nlargest(topN)` then take the smallest of that set).
@@ -248,6 +332,7 @@ function detectSignals(close, high, low, volume, ema50, ema200, rsi, macd, bbWid
   const n = close.length;
   const empty = {
     goldenCross: false, deathCross: false,
+    emaBullish: false, emaBearish: false,
     rsiOversold: false, rsiOverbought: false,
     macdBullish: false, macdBearish: false,
     volumeSpike: false, breakout52w: false,
@@ -267,6 +352,11 @@ function detectSignals(close, high, low, volume, ema50, ema200, rsi, macd, bbWid
 
   const goldenCross = !!(le50 != null && le200 != null && pe50 != null && pe200 != null && le50 > le200 && pe50 <= pe200);
   const deathCross = !!(le50 != null && le200 != null && pe50 != null && pe200 != null && le50 < le200 && pe50 >= pe200);
+  // Persistent trend state (unlike goldenCross/deathCross, which only fire
+  // on the single day the crossover happens) — stays true for as long as
+  // the alignment holds, so the badge doesn't vanish the day after a cross.
+  const emaBullish = !!(le50 != null && le200 != null && le50 > le200);
+  const emaBearish = !!(le50 != null && le200 != null && le50 < le200);
   const rsiOversold = lr != null && lr < 30;
   const rsiOverbought = lr != null && lr > 70;
   const macdBullish = !!(lm != null && ls != null && pm != null && ps != null && lm > ls && pm <= ps);
@@ -294,7 +384,8 @@ function detectSignals(close, high, low, volume, ema50, ema200, rsi, macd, bbWid
   const bullZone = !!(lc != null && le200 != null && lc > le200);
 
   return {
-    goldenCross, deathCross, rsiOversold, rsiOverbought,
+    goldenCross, deathCross, emaBullish, emaBearish,
+    rsiOversold, rsiOverbought,
     macdBullish, macdBearish, volumeSpike, breakout52w,
     bbSqueeze, bullZone,
   };
@@ -307,5 +398,7 @@ window.calcRSI = calcRSI;
 window.calcMACD = calcMACD;
 window.calcBollinger = calcBollinger;
 window.calcOBV = calcOBV;
+window.calcVWAP = calcVWAP;
+window.calcATR = calcATR;
 window.findSupportResistance = findSupportResistance;
 window.detectSignals = detectSignals;
